@@ -106,9 +106,10 @@ gate with firewall rules or an authenticated TLS proxy.
 | Expected normal output reserve | 4,096 |
 | Expected compression output reserve | 8,192 |
 | Healthy heavy concurrency | 4 |
-| Caution memory headroom | below 10 GiB |
+| Caution memory headroom | below 8 GiB |
 | Critical memory headroom | below 6 GiB |
 | Telemetry maximum age | 30 seconds |
+| Slow response start (unhealthy) | above 60 seconds |
 
 All token limits are command-line options. Start conservatively and tune from
 measured workload behavior:
@@ -121,6 +122,26 @@ The controller reduces admission to one slot under caution pressure. It closes
 new admission under critical pressure, after a new OOM kill, or when telemetry
 becomes unhealthy. Recent upstream failures and slow eligible response starts
 also reduce concurrency and start a cooldown.
+
+Set these lines against measured behavior, not intuition. Two of them are easy
+to set too tight, and both failures look the same from outside - compression
+stops happening while the cluster looks fine:
+
+- **Caution headroom** must sit below steady-state usage. A line drawn at the
+  usual free memory leaves the controller permanently in caution, serving one
+  request at a time with memory pressure never actually rising.
+- **Slow response start** is not a measure of health on a long-context engine.
+  A 45k-token prefill measured 10.9 seconds here while the engine was serving
+  other work, so a 20-second line read ordinary prefill as illness and closed
+  admission for a minute at a time.
+
+When admission closes because telemetry is *missing* rather than because
+pressure was *observed*, one compression slot stays open. Compression is the
+only work that makes a conversation smaller; starving it guarantees that every
+later request in that conversation is rejected for size. The shared token
+budget still applies, so the floor admits one bounded call, never an unmetered
+one. Observed pressure - critical headroom, a new OOM kill, upstream failure -
+still closes that slot too.
 
 ## Token estimate and its limits
 

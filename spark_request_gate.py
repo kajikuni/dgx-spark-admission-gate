@@ -28,6 +28,17 @@ EXPECTED_OUTPUT_RESERVE = 4096
 COMPRESSION_OUTPUT_RESERVE = 8192
 ESTIMATE_OVERHEAD = 1024
 ESTIMATE_METHOD = "unicode_weighted_json_plus_expected_output"
+# Steady-state headroom on a loaded node sits a little above the caution line on 128GB hardware,
+# so a 10 GiB line put the controller into permanent memory_pressure with PSI flat at zero.
+CRITICAL_HEADROOM_GIB = 6
+CAUTION_HEADROOM_GIB = 8
+# Time to first token says little about engine health on a long-context cluster: a 45k-token
+# prefill measured 10.9s with the engine otherwise busy, so a 20s line read normal prefill as
+# illness and closed admission for a minute.  This is the "something is actually wrong" line.
+SLOW_RESPONSE_SECONDS = 60
+# Admission kinds whose target of 0 means "we cannot see the cluster" rather than "the cluster is
+# under proven pressure".  Only these keep the compression floor open.
+BLIND_REASONS = frozenset({"telemetry_unhealthy"})
 
 
 class EstimatedTokenBudget:
@@ -54,6 +65,7 @@ class Gate:
         self._kind_waiting = {"normal": 0, "compression": 0}
         self._kind_completed = {"normal": 0, "compression": 0}
         self._next_kind = "compression"  # when both have work, first grant is compression
+        self.compression_floor = 0  # slots compression keeps even when `limit` is 0
         self._upstream_failures = deque()
         self._response_starts = deque()
         self._header_wait = {}
@@ -65,6 +77,19 @@ class Gate:
         if not isinstance(new_limit, int) or new_limit < 0:
             raise ValueError("limit must be a non-negative integer")
         self.limit = new_limit
+        self._pump()
+
+    def set_compression_floor(self, floor):
+        """Slots compression may use even when `limit` is 0.
+
+        Closing admission entirely is the right answer to proven pressure, but it is the wrong
+        answer to absent telemetry: a conversation that cannot compress keeps growing until every
+        later request is rejected outright.  The shared token budget still applies, so a floor
+        admits at most one bounded compression call, never an unmetered one.
+        """
+        if not isinstance(floor, int) or isinstance(floor, bool) or not 0 <= floor <= 1:
+            raise ValueError("compression floor must be 0 or 1")
+        self.compression_floor = floor
         self._pump()
 
     def record_upstream_failure(self, now=None):
@@ -91,9 +116,12 @@ class Gate:
                 "inflight_header_age": max((now - started for started in self._header_wait.values()), default=0)}
 
     def _pump(self):
-        while self.active < self.limit and (self._queue or self._compression_queue):
-            heads = {"normal": self._queue[0] if self._queue else None,
-                     "compression": self._compression_queue[0] if self._compression_queue and self._kind_active["compression"] < 1 else None}
+        while self._queue or self._compression_queue:
+            under_limit = self.active < self.limit
+            compression_admissible = self._kind_active["compression"] < 1 and (
+                under_limit or self._kind_active["compression"] < self.compression_floor)
+            heads = {"normal": self._queue[0] if self._queue and under_limit else None,
+                     "compression": self._compression_queue[0] if self._compression_queue and compression_admissible else None}
             eligible = [kind for kind, ticket in heads.items() if ticket is not None and (self.budget is None or self.budget.can_reserve(ticket.cost))]
             if not eligible: break
             kind = self._next_kind if self._next_kind in eligible else eligible[0]
@@ -238,7 +266,14 @@ class CapacityFileProvider:
             required_engine = ("ok", "running", "queued", "cached_tokens", "pending_tokens", "ts_unix", "ts_tic")
             if age < -1 or age > 30 or not all(k in engine for k in required_engine) or not all(finite_number(engine[k]) and engine[k] >= 0 for k in required_engine if k != "ok"):
                 return None
-            if engine["ok"] is not True or now - engine["ts_unix"] < -1 or now - engine["ts_unix"] > 30 or not finite_number(engine.get("source_age_s")) or not 0 <= engine["source_age_s"] <= 30:
+            if engine["ok"] is not True or now - engine["ts_unix"] < -1 or now - engine["ts_unix"] > 30:
+                return None
+            # A missing source age is not evidence of staleness - engine ts_unix freshness is
+            # already enforced above.  Dropping the whole sample for it closed admission while the
+            # engine was healthy and serving, which starved compression.  When the collector does
+            # report an age it must still be in range.
+            source_age = engine.get("source_age_s")
+            if source_age is not None and (not finite_number(source_age) or not 0 <= source_age <= 30):
                 return None
             headrooms, some, full, ooms = [], [], [], []
             for node in nodes:
@@ -286,13 +321,15 @@ class AdaptiveController:
                     "estimate_method": ESTIMATE_METHOD,
                     "note": "Unicode-aware estimate; declared output above the expected cap is not fully reserved.",
                 },
-                "thresholds": {"critical_headroom_gib": 6, "caution_headroom_gib": 10, "critical_cached_pending": 262144, "caution_cached_pending": 196608}}
+                "thresholds": {"critical_headroom_gib": CRITICAL_HEADROOM_GIB, "caution_headroom_gib": CAUTION_HEADROOM_GIB, "critical_cached_pending": 262144, "caution_cached_pending": 196608, "slow_response_seconds": SLOW_RESPONSE_SECONDS},
+                "compression_floor": self.heavy.compression_floor}
 
     def _set(self, target, reason, now):
         target = max(0, min(4, int(target)))
         changed = target != self.target or self.heavy.limit != target or self.light.limit != (1 if target else 0)
         self.target, self.reason = target, reason
         self.heavy.set_limit(target); self.light.set_limit(1 if target else 0)
+        self.heavy.set_compression_floor(1 if target == 0 and reason in BLIND_REASONS else 0)
         if changed:
             self.last_change = now
         if reason != self._last_logged_reason:
@@ -318,10 +355,11 @@ class AdaptiveController:
         # cached_tokens can include evictable idle cache: only treat it as critical
         # while the engine is actively serving work; idle cache drains to limit 1.
         token_critical = self.kv_usage >= 262144 and sample.get("running", 0) > 0
-        critical = (self.min_headroom < 6 or sample.get("psi_full", 0) >= 5 or oom_increase or token_critical)
-        caution = (self.min_headroom < 10 or self.psi >= 1 or self.kv_usage >= 196608)
+        critical = (self.min_headroom < CRITICAL_HEADROOM_GIB or sample.get("psi_full", 0) >= 5 or oom_increase or token_critical)
+        caution = (self.min_headroom < CAUTION_HEADROOM_GIB or self.psi >= 1 or self.kv_usage >= 196608)
         errors = self.heavy.recent_upstream_failures(now) + self.light.recent_upstream_failures(now)
-        slow = self.heavy.latency_status(now)["control_max"] > 20 or self.light.latency_status(now)["control_max"] > 20
+        slow = (self.heavy.latency_status(now)["control_max"] > SLOW_RESPONSE_SECONDS
+                or self.light.latency_status(now)["control_max"] > SLOW_RESPONSE_SECONDS)
         if critical:
             self.healthy_since = None; self.cooldown_until = now + 60; self._set(0, "critical_pressure", now); return
         if caution:

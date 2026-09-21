@@ -220,10 +220,20 @@ def test_nonstream_heavy_latency_is_observed_but_not_controlled():
     assert heavy.status()["response_start_latency"]["control_max"] == 0
 
 
+def test_long_prefill_is_not_mistaken_for_an_unhealthy_engine():
+    """A 45k-token prefill measured ~11s on this hardware; slowness alone is not illness."""
+    heavy, light = Gate(2, 2, "heavy"), Gate(1, 2, "light")
+    controller = AdaptiveController(heavy, light, None); controller.target = 2; heavy.set_limit(2)
+    heavy.record_response_start(25, now=10, control_eligible=True)
+    sample = {"fresh": True, "engines_ok": True, "min_headroom": 13, "psi": 0, "psi_full": 0, "kv_usage": 0, "running": 0, "queued": 0}
+    controller.evaluate(sample, now=10)
+    assert heavy.limit == 4 and controller.reason == "healthy"
+
+
 def test_stream_slow_response_reduces_capacity():
     heavy, light = Gate(2, 2, "heavy"), Gate(1, 2, "light")
     controller = AdaptiveController(heavy, light, None); controller.target = 2; heavy.set_limit(2)
-    heavy.record_response_start(21, now=10, control_eligible=True)
+    heavy.record_response_start(61, now=10, control_eligible=True)
     sample = {"fresh": True, "engines_ok": True, "min_headroom": 13, "psi": 0, "psi_full": 0, "kv_usage": 0, "running": 0, "queued": 0}
     controller.evaluate(sample, now=10)
     assert heavy.limit == 1 and controller.reason == "slow_response"
@@ -430,3 +440,74 @@ async def test_light_validation_and_active_disconnect(servers):
         assert status['heavy']['active']==0
         assert status['heavy']['waiting']==0
         release.set()
+
+
+def _fresh_capacity(now, **engine_overrides):
+    node = {"ts_unix": now, "boot_id": "b", "mem_available_gib": 13, "mem_total_gib": 16,
+            "psi_some_avg10": 0, "psi_full_avg10": 0, "oom_kill_total": 0}
+    engine = {"ok": True, "running": 3, "queued": 0, "cached_tokens": 1, "pending_tokens": 0,
+              "ts_unix": now, "ts_tic": now, "source_age_s": 0}
+    engine.update(engine_overrides)
+    return {"ts_unix": now, "complete": True,
+            "nodes": {name: node for name in ("spark-a", "spark-b", "spark-c", "spark-d")},
+            "engine": engine}
+
+
+@pytest.mark.asyncio
+async def test_busy_engine_without_source_age_is_still_usable(tmp_path):
+    """A missing source age must not discard an otherwise fresh sample.
+
+    The collector drops source_age_s when /health answers slowly, which happens precisely while
+    the engine is loaded. Treating that as unhealthy closed admission on a healthy cluster.
+    """
+    now = __import__('time').time()
+    path = tmp_path / "capacity.json"
+    path.write_text(json.dumps(_fresh_capacity(now, source_age_s=None)))
+    result = await CapacityFileProvider(path)()
+    assert result is not None and result["fresh"] and result["running"] == 3
+    # An age that is present but implausible is still rejected.
+    path.write_text(json.dumps(_fresh_capacity(now, source_age_s=99)))
+    assert await CapacityFileProvider(path)() is None
+
+
+def test_caution_line_leaves_room_above_steady_state_usage():
+    heavy, light = Gate(1, 4, "heavy"), Gate(1, 4, "light")
+    controller = AdaptiveController(heavy, light, None)
+    steady = {"fresh": True, "engines_ok": True, "age": 1, "min_headroom": 9,
+              "psi": 0, "psi_full": 0, "kv_usage": 0, "running": 1, "queued": 0}
+    controller.evaluate(steady, now=10)
+    assert controller.reason == "healthy" and heavy.limit == 4
+    controller.evaluate({**steady, "min_headroom": 7.5}, now=20)
+    assert controller.reason == "memory_pressure" and heavy.limit == 1
+
+
+@pytest.mark.asyncio
+async def test_compression_floor_admits_while_telemetry_is_missing():
+    """Absent telemetry closes normal admission but must not starve compression.
+
+    A conversation that cannot compress only grows, so every later request fails outright.
+    """
+    heavy, light = Gate(4, 4, "heavy"), Gate(1, 4, "light")
+    controller = AdaptiveController(heavy, light, None)
+    controller.evaluate(None, now=10)
+    assert controller.reason == "telemetry_unhealthy" and heavy.limit == 0
+    assert heavy.compression_floor == 1 and controller.status()["compression_floor"] == 1
+    admission = await heavy.acquire(1, cost=10, kind="compression")
+    assert heavy.status()["kinds"]["compression"]["active"] == 1
+    blocked = asyncio.create_task(heavy.acquire(1, cost=10, kind="normal"))
+    await asyncio.sleep(.01)
+    assert heavy.status()["kinds"]["normal"]["active"] == 0
+    blocked.cancel()
+    with __import__('contextlib').suppress(asyncio.CancelledError, Exception):
+        await blocked
+    heavy.release(ticket=admission)
+
+
+def test_proven_pressure_still_closes_compression():
+    """The floor is for blindness, not for pressure we can actually see."""
+    heavy, light = Gate(4, 4, "heavy"), Gate(1, 4, "light")
+    controller = AdaptiveController(heavy, light, None)
+    controller.evaluate({"fresh": True, "engines_ok": True, "age": 1, "min_headroom": 2,
+                         "psi": 0, "psi_full": 0, "kv_usage": 0, "running": 1, "queued": 0}, now=10)
+    assert controller.reason == "critical_pressure" and heavy.limit == 0
+    assert heavy.compression_floor == 0

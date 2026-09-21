@@ -22,6 +22,9 @@ DEFAULT_NODES = {
     "spark-d": "spark-d",
 }
 DEFAULT_OUTPUT = Path.home() / ".local/state/dgx-spark-admission-gate/capacity.json"
+# Residual error is the head-node ssh probe latency plus transport jitter; a few seconds of
+# slack keeps a healthy-but-busy engine reportable instead of silently unusable.
+CLOCK_SKEW_TOLERANCE_S = 5.0
 REMOTE_PROBE = (
     "LC_ALL=C; boot_id=$(cat /proc/sys/kernel/random/boot_id) || exit 11; "
     "awk '/^MemTotal:|^MemAvailable:/{print $1 \"=\" $2}' /proc/meminfo; "
@@ -101,6 +104,7 @@ def collect_engine(now, a_uptime, a_sample_ts, engine_url="http://127.0.0.1:8888
         base = engine_url.rstrip("/")
         health = health_ok(base + "/health", timeout=3)
         loads = get_json(base + "/get_load", timeout=3)
+        loads_ts = time.time()
         if not isinstance(loads, list) or not loads:
             raise ValueError("invalid_load")
         fields = ("num_reqs", "num_waiting_reqs", "num_tokens", "num_pending_tokens", "ts_tic")
@@ -115,9 +119,12 @@ def collect_engine(now, a_uptime, a_sample_ts, engine_url="http://127.0.0.1:8888
                 and isinstance(a_sample_ts, (int, float)) and math.isfinite(a_uptime)
                 and math.isfinite(a_sample_ts)):
             # /get_load is fetched after the node probe. Estimate the matching /proc/uptime
-            # at the engine observation time; tolerate scheduling/transport skew up to one second.
-            estimated_uptime = a_uptime + max(0.0, now - a_sample_ts)
-            if ts_tic <= estimated_uptime + 1.0:
+            # at the instant /get_load answered - not at the start of the engine probe.  /health is
+            # polled first and slows down under load, so anchoring on `now` made ts_tic look ahead of
+            # the estimate exactly when the engine was busy.  That turned a busy engine into a dropped
+            # sample, which closed the gate (telemetry_unhealthy) and starved compression.
+            estimated_uptime = a_uptime + max(0.0, loads_ts - a_sample_ts)
+            if ts_tic <= estimated_uptime + CLOCK_SKEW_TOLERANCE_S:
                 source_age = max(0.0, estimated_uptime - ts_tic)
         return {"ok": health, "running": sum(row["num_reqs"] for row in loads),
                 "queued": sum(row["num_waiting_reqs"] for row in loads), "cached_tokens": sum(row["num_tokens"] for row in loads),
