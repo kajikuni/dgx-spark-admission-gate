@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dgx-spark-admission-gate"
+version = "0.1.0"
+description = "Token reservation and memory-pressure admission control for a four-node DGX Spark inference cluster"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "Kunihiko Kaji"}]
+dependencies = ["aiohttp>=3.9,<4"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10", "pytest-asyncio>=0.23,<2", "pytest-aiohttp>=1.0,<2"]
+
+[project.scripts]
+spark-request-gate = "spark_request_gate:main"
+spark-capacity-collect = "spark_capacity_collect:main"
+
+[tool.setuptools]
+py-modules = ["spark_request_gate", "spark_capacity_collect"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

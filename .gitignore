@@ -1,0 +1,7 @@
+__pycache__/
+.pytest_cache/
+.venv/
+*.egg-info/
+*.py[cod]
+capacity.json*
+.DS_Store

@@ -1,0 +1,12 @@
+[Unit]
+Description=DGX Spark OpenAI admission gate
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.venvs/dgx-spark-admission-gate/bin/spark-request-gate --host 0.0.0.0 --port 18888 --upstream http://spark-a:8888 --adaptive
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

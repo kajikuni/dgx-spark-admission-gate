@@ -1,0 +1,11 @@
+[Unit]
+Description=DGX Spark capacity collector
+
+[Service]
+Type=simple
+ExecStart=%h/.venvs/dgx-spark-admission-gate/bin/spark-capacity-collect --engine-url http://spark-a:8888
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
