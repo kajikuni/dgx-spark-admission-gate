@@ -174,6 +174,20 @@ The collector currently expects exactly four nodes named `spark-a` through
 front another OpenAI-compatible server, but adaptive mode needs that telemetry
 schema or a compatible provider implementation.
 
+## Switchless four-node fabric
+
+The production setup that motivated this gate uses a switchless four-node DGX
+Spark ring. Fabric construction is maintained separately in
+[FujitsuPolycom/SparkRing](https://github.com/FujitsuPolycom/sparkring). That
+project contains the patched NCCL transport, ring and virtual-mesh host setup,
+model profiles, launch tooling, and validation records.
+
+The custom `NCCL_SWITCHLESS_RING_ONLY` and `NCCL_SKIP_TREE_CONNECT` settings
+belong to SparkRing's patched NCCL; they are not stock NCCL options. Follow the
+exact profile and library version documented there. The admission gate is
+transport-independent and only sits in front of the resulting OpenAI-compatible
+endpoint.
+
 ## 日本語要約
 
 長大会話の圧縮を何度も再試行してリクエストがさらに肥大化する問題に対し、
